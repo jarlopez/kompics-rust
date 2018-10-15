@@ -22,6 +22,7 @@ extern crate uuid;
 extern crate kompact_component_derive;
 #[macro_use]
 extern crate kompact_actor_derive;
+extern crate petty;
 extern crate sequence_trie as trie;
 #[macro_use]
 extern crate slog;

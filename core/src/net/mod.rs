@@ -26,6 +26,8 @@ use tokio_retry::strategy::ExponentialBackoff;
 use tokio::net::ConnectFuture;
 use tokio_retry::Retry;
 use KompicsLogger;
+use std::net::SocketAddrV4;
+use petty::ev_loop::events::StateEvent;
 
 #[derive(Debug)]
 pub enum ConnectionState {
@@ -39,9 +41,9 @@ pub enum ConnectionState {
 pub mod events {
     use std;
 
-    use super::ConnectionState;
     use spnl::frames::Frame;
     use std::net::SocketAddr;
+    use net::ConnectionState;
 
     /// Network events emitted by the network `Bridge`
     #[derive(Debug)]
@@ -101,8 +103,8 @@ pub struct Bridge {
     /// Shared actor refernce lookup table
     lookup: Arc<ArcCell<ActorStore>>,
     /// Thread blocking on the Tokio runtime
-    net_thread: Option<JoinHandle<()>>,
-    /// Reference back to the Kompics dispatcher
+    tokio_thread: Option<JoinHandle<()>>,
+    /// Reference back to the Kompact dispatcher
     dispatcher: Option<ActorRef>,
 }
 
@@ -124,7 +126,7 @@ impl Bridge {
             events: sender,
             log,
             lookup,
-            net_thread: None,
+            tokio_thread: None,
             dispatcher: None,
         };
 
@@ -147,10 +149,10 @@ impl Bridge {
             self.lookup.clone(),
         );
         self.executor = Some(ex);
-        self.net_thread = Some(th);
+        self.tokio_thread = Some(th);
     }
 
-    /// Attempts to establish a TCP connection to the provided `addr`.
+    /// Attempts to establish a connection to the provided `addr`.
     ///
     /// # Side effects
     /// When the connection is successul:
@@ -207,6 +209,10 @@ impl Bridge {
                     Err(NetworkError::MissingExecutor)
                 }
             }
+            Transport::UDP => {
+                debug!(self.log, "Establishing remote UDP channel");
+                Err(NetworkError::UnsupportedProtocol)
+            }
             _other => Err(NetworkError::UnsupportedProtocol),
         }
     }
@@ -227,7 +233,7 @@ impl tokio_retry::Action for TcpConnecter {
 /// Spawns a TCP server on the provided `TaskExecutor` and `addr`.
 ///
 /// Connection result and errors are propagated on the provided `events`.
-fn start_tcp_server(
+fn setup_tcp_server(
     executor: TaskExecutor,
     log: KompicsLogger,
     addr: SocketAddr,
@@ -265,6 +271,48 @@ fn start_tcp_server(
     server
 }
 
+
+/// Spawns a UDT server on the provided `TaskExecutor` and `addr`.
+///
+/// Connection result and errors are propagated on the provided `events`.
+fn setup_udt_server(
+    executor: TaskExecutor,
+    log: KompicsLogger,
+    addr: SocketAddr,
+    events: sync::mpsc::UnboundedSender<NetworkEvent>,
+    lookup: Arc<ArcCell<ActorStore>>,
+) -> impl Future<Item = (), Error = ()> {
+    let err_log = log.clone();
+    let server = TcpListener::bind(&addr).expect("could not bind to address");
+    let err_events = events.clone();
+    let server = server
+        .incoming()
+        .map_err(move |e| {
+            error!(err_log, "err listening on TCP socket");
+            err_events.unbounded_send(NetworkEvent::Connection(addr, ConnectionState::Error(e)));
+        }).for_each(move |tcp_stream| {
+        debug!(log, "connected TCP client at {:?}", tcp_stream);
+        let lookup = lookup.clone();
+        let peer_addr = tcp_stream
+            .peer_addr()
+            .expect("stream must have a peer address");
+        let (tx, rx) = sync::mpsc::unbounded();
+        executor.spawn(handle_tcp(
+            tcp_stream,
+            rx,
+            events.clone(),
+            log.clone(),
+            lookup,
+        ));
+        events.unbounded_send(NetworkEvent::Connection(
+            peer_addr,
+            ConnectionState::Connected(tx),
+        ));
+        Ok(())
+    });
+    server
+}
+
 /// Spawns a new thread responsible for driving the Tokio runtime to completion.
 ///
 /// # Returns
@@ -278,14 +326,24 @@ fn start_network_thread(
 ) -> (TaskExecutor, JoinHandle<()>) {
     use std::thread::Builder;
 
+    let petty_th_name = {
+        let mut s =  name.clone();
+        s.push_str("--petty-loop");
+        s
+    };
+    // TODO make this child of Bridge's logger, not tokio-runtime thread logger
+    let petty_log = log.clone();
+
     let (tx, rx) = sync::oneshot::channel();
-    let th = Builder::new()
+    let tokio_th = Builder::new()
         .name(name)
         .spawn(move || {
             let mut runtime = Runtime::new().expect("runtime creation in network main thread");
             let executor = runtime.executor();
 
-            runtime.spawn(start_tcp_server(
+
+            // Spawn TCP server on the network thread
+            runtime.spawn(setup_tcp_server(
                 executor.clone(),
                 log.clone(),
                 addr,
@@ -295,12 +353,65 @@ fn start_network_thread(
 
             let _res = tx.send(executor);
             runtime.shutdown_on_idle().wait().unwrap();
-        }).expect("TCP serve thread spawning should not fail");
+        }).expect("Tokio runtime thread spawning should not fail");
     let executor = rx
         .wait()
         .expect("could not receive executor clone; did network thread panic?");
 
-    (executor, th)
+    // UDT setup
+    let petty_th = {
+        let executor = executor.clone();
+        let events = events.clone();
+
+        Builder::new()
+            .name(petty_th_name)
+            .spawn(move || {
+                use petty::ev_loop::*;
+                use petty::ops::Ops;
+                use petty::transport::udt::*;
+                use petty::udt::*;
+
+                // TODO move to config
+                const UDT_SERVER_BACKLOG: i32 = 32;
+
+                let sock = UdtSocket::new(SocketFamily::AFInet, SocketType::Stream).unwrap();
+                sock.bind(addr).unwrap();
+                info!(petty_log, "UDT server bound to {:?}", sock.getsockname().unwrap());
+                sock.listen(UDT_SERVER_BACKLOG).unwrap();
+                info!(petty_log, "UDT server is now listening for connections");
+
+                // Set up event-loop data
+                let (mut event_loop, tasks, udt_events) = {
+                    let ch = UdtChannel::new(sock, ChannelKind::Acceptor);
+                    let key = UdtKey::new(ch);
+                    let ops = Ops::with_accept();
+                    let selector = UdtSelector::new().expect("internal UDT err on creation");
+                    let (mut event_loop, tasks, events) = SelectorEventLoop::new(selector);
+                    event_loop.register(key, ops);
+                    (event_loop, tasks, events)
+                };
+                info!(petty_log, "Entering Petty event loop");
+                event_loop.run();
+
+                executor.spawn(|| {
+                    udt_events.for_each(|ev| {
+                        match ev {
+                            Trigger::State(StateEvent::Connected(udt_socket, addr)) => {
+                                let (tx, rx) = futures::sync::mpsc::unbounded();
+                                events.unbounded_send(NetworkEvent::Connection(addr, ConnectionState::Connected(tx)))
+                                // TODO handle the 'rx' end by spawning a task for funneling it into a pipeline and transforming it
+                                // TODO into length-delimited frames (just like handle_tcp)
+                            },
+                            Trigger::Read(_) => {},
+                            Trigger::Write(_) => {},
+                            Trigger::Error(_) => {},
+                        }
+                    })
+                });
+            }).expect("Petty thread loop spawning should not fail");
+    };
+
+    (executor, tokio_th)
 }
 
 /// Returns a future which drives TCP I/O over the [FrameCodec].

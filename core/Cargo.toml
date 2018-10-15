@@ -52,6 +52,9 @@ tokio-retry = "0.2.0"
 spaniel = "0.1"
 bitfields = "0.1"
 
+[dependencies.petty]
+path = "../../petty"
+
 #[dependencies.spaniel]
 #git = "https://github.com/jarlopez/spaniel"
 #branch = "master"
